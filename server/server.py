@@ -41,7 +41,6 @@ import os
 import tempfile
 import json
 import time
-import subprocess
 import uuid
 import shutil
 from pathlib import Path
@@ -57,6 +56,15 @@ from download_reel import (
     fetch_metadata,
     download_video,
     ReelDownloadError,
+)
+from reel_processing import (
+    extract_audio,
+    extract_key_frames,
+    extract_key_frames_from_moments,
+    generate_pdf,
+    summarize_transcript,
+    transcribe_audio,
+    translate_recipe_and_moments,
 )
 
 app = Flask(__name__)
@@ -77,298 +85,114 @@ def emit_progress(step: str, message: str, progress: int = 0) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-def extract_audio(video_path: Path, out_audio: Path) -> None:
-    """Extract mono WAV audio track at 16kHz using ffmpeg."""
-    cmd = [
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-ac", "1", "-ar", "16000", "-vn",
-        str(out_audio),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
+def normalize_transcription_mode(mode: Optional[str]) -> str:
+    """Validate and normalize transcription mode query values."""
+    valid_modes = {"auto", "openai", "local"}
+    if not mode:
+        return "auto"
+    mode_lower = mode.lower()
+    return mode_lower if mode_lower in valid_modes else "auto"
 
 
-def transcribe_with_openai(audio_path: Path) -> tuple[str, list]:
-    """Transcribe audio using OpenAI Whisper API."""
+def _is_truthy(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def parse_translation_params(args) -> tuple[bool, Optional[str]]:
+    """Determine translation preferences from request arguments."""
+    lang_raw = args.get("lang") or args.get("language")
+    translate_raw = args.get("translate")
+
+    translate = False
+    target_lang: Optional[str] = None
+
+    if lang_raw:
+        lang = lang_raw.strip()
+        if lang and lang.lower() not in {"none", "original"}:
+            target_lang = lang
+            translate = True
+
+    if translate_raw:
+        if _is_truthy(translate_raw):
+            translate = True
+            if not target_lang:
+                target_lang = "English"
+        elif translate_raw.lower() in {"0", "false", "no", "off"}:
+            translate = False
+            if not (lang_raw and target_lang):
+                target_lang = None
+
+    if translate and not target_lang:
+        target_lang = "English"
+
+    return translate, target_lang
+
+
+def update_frame_labels_from_moments(
+    frame_paths: List[tuple[Path, str]],
+    key_moments: List[Dict[str, object]],
+) -> List[tuple[Path, str]]:
+    """Return frames with labels updated from key moment descriptions."""
+    if not key_moments:
+        return frame_paths
+
+    updated: List[tuple[Path, str]] = []
+    for idx, (frame_path, label) in enumerate(frame_paths):
+        if idx < len(key_moments):
+            description = str(key_moments[idx].get("description", "")).strip()
+            updated.append((frame_path, description or label))
+        else:
+            updated.append((frame_path, label))
+    return updated
+
+
+def apply_translation_if_needed(
+    recipe: str,
+    key_moments: List[Dict[str, object]],
+    frame_paths: List[tuple[Path, str]],
+    translate: bool,
+    target_lang: Optional[str],
+) -> tuple[str, List[Dict[str, object]], List[tuple[Path, str]], Optional[str], str]:
+    """
+    Translate recipe and key moments when requested.
+
+    Returns (final_recipe, final_key_moments, frame_paths_for_pdf, language, status)
+    where status is one of {"not_requested", "applied", "unchanged", "failed"}.
+    """
+    if not translate or not recipe.strip():
+        return recipe, key_moments, frame_paths, None, "not_requested"
+
+    translation_language = target_lang or "English"
     try:
-        import openai
-    except ImportError:
-        raise RuntimeError("openai package required")
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    openai.api_key = api_key
-
-    with audio_path.open("rb") as fh:
-        transcript = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=fh,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"]
+        translated_recipe, translated_moments = translate_recipe_and_moments(
+            recipe,
+            key_moments,
+            translation_language,
         )
-        text = transcript.text
-        segments = []
-        if transcript.segments is not None:
-            segments = [
-                {'start': seg.start, 'end': seg.end, 'text': seg.text}
-                for seg in transcript.segments
-            ]
-        return text, segments
+        translation_changed = (
+            translated_recipe != recipe or translated_moments != key_moments
+        )
+        updated_frames = (
+            update_frame_labels_from_moments(frame_paths, translated_moments)
+            if key_moments
+            else frame_paths
+        )
+        status = "applied" if translation_changed else "unchanged"
+        return translated_recipe, translated_moments, updated_frames, translation_language, status
+    except Exception as exc:
+        print(f"[ERROR] Translation failed: {exc}")
+        return recipe, key_moments, frame_paths, translation_language, "failed"
 
 
-def format_transcript_with_timestamps(segments: list) -> str:
-    """Format transcript segments with timestamps."""
-    lines = []
-    for seg in segments:
-        start_time = int(seg['start'])
-        minutes = start_time // 60
-        seconds = start_time % 60
-        lines.append(f"[{minutes:02d}:{seconds:02d}] {seg['text'].strip()}")
-    return "\n".join(lines)
-
-
-def summarize_with_openai(transcript_with_ts: str, model: str = "gpt-3.5-turbo") -> tuple[str, List[dict]]:
-    """
-    Summarize transcript using OpenAI GPT API.
-    Returns (recipe_text, key_moments).
-    """
-    try:
-        import openai
-    except ImportError:
-        raise RuntimeError("openai package required")
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY environment variable not set for summarization")
-
-    openai.api_key = api_key
-
-    # Chunk if too large (simple char-based chunking)
-    max_chars = 3000
-    chunks = [transcript_with_ts[i:i+max_chars] for i in range(0, len(transcript_with_ts), max_chars)]
-
-    all_key_moments: List[dict] = []
-    summaries: List[str] = []
-
-    for chunk in chunks:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant who creates recipes from video transcripts. "
-                    "The user will provide a transcript with timestamps in the format [MM:SS]. "
-                    "Your task is to:\n"
-                    "1. Extract the recipe, listing ingredients first, then numbered instructions\n"
-                    "2. Identify key moments - for each instruction step, provide the timestamp where that action happens\n\n"
-                    "Format your response as:\n"
-                    "RECIPE:\n"
-                    "[ingredients and instructions here]\n\n"
-                    "KEY_MOMENTS:\n"
-                    "[MM:SS] Brief description of step 1\n"
-                    "[MM:SS] Brief description of step 2\n"
-                    "etc.\n\n"
-                    "Be clear and concise. Ignore any conversational filler."
-                ),
-            },
-            {"role": "user", "content": f"Here is the transcript:\n\n{chunk}"},
-        ]
-        resp = openai.chat.completions.create(model=model, messages=messages, temperature=0.2, max_tokens=500)
-        content = resp.choices[0].message.content
-        if content is None:
-            raise RuntimeError("OpenAI returned empty response")
-
-        # Parse the response
-        recipe_part, key_moments_part = parse_llm_response(content)
-        summaries.append(recipe_part)
-        all_key_moments.extend(key_moments_part)
-
-    if len(summaries) == 1:
-        return summaries[0], all_key_moments
-
-    # If multiple chunks, combine and compress
-    combined = "\n\n".join(summaries)
-    combined_moments = "\n".join([f"[{m['timestamp']}] {m['description']}" for m in all_key_moments])
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful assistant who creates recipes. "
-                "Consolidate these recipe fragments into one coherent recipe with ingredients and numbered instructions. "
-                "Also consolidate the key moments, removing duplicates."
-            ),
-        },
-        {"role": "user", "content": f"RECIPES:\n{combined}\n\nKEY MOMENTS:\n{combined_moments}"},
-    ]
-    resp = openai.chat.completions.create(model=model, messages=messages, temperature=0.2, max_tokens=500)
-    content = resp.choices[0].message.content
-    if content is None:
-        raise RuntimeError("OpenAI returned empty response")
-
-    recipe_part, key_moments_part = parse_llm_response(content)
-    return recipe_part, key_moments_part
-
-
-def parse_llm_response(response: str) -> tuple[str, List[dict]]:
-    """Parse LLM response into recipe text and key moments."""
-    import re
-
-    parts = response.split("KEY_MOMENTS:")
-
-    recipe = parts[0].replace("RECIPE:", "").strip()
-
-    key_moments = []
-    if len(parts) > 1:
-        moments_text = parts[1].strip()
-        for line in moments_text.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            # Match [MM:SS] or [M:SS] format
-            match = re.match(r'\[(\d{1,2}):(\d{2})\]\s*(.+)', line)
-            if match:
-                minutes, seconds, description = match.groups()
-                timestamp = int(minutes) * 60 + int(seconds)
-                key_moments.append({
-                    'timestamp': timestamp,
-                    'description': description.strip()
-                })
-
-    return recipe, key_moments
-
-
-def extract_key_frames_from_moments(video_path: Path, output_dir: Path, key_moments: List[dict]) -> List[tuple[Path, str]]:
-    """Extract frames at timestamps identified by the LLM."""
-    frames = []
-    for i, moment in enumerate(key_moments):
-        timestamp = moment['timestamp']
-        frame_path = output_dir / f"key_frame_{i:03d}.jpg"
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(timestamp),
-            "-i", str(video_path),
-            "-vframes", "1",
-            "-q:v", "2",
-            str(frame_path)
-        ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            label = moment['description']
-            frames.append((frame_path, label))
-        except subprocess.CalledProcessError:
-            continue
-
-    return frames
-
-
-def generate_pdf(recipe: str, frame_paths: List[tuple[Path, str]], output_path: Path, video_name: str) -> None:
-    """Generate a PDF with recipe and video frames."""
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib.units import inch
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
-    from reportlab.lib.colors import HexColor
-    from reportlab.lib.utils import ImageReader
-
-    doc = SimpleDocTemplate(
-        str(output_path), pagesize=letter,
-        topMargin=0.75*inch, bottomMargin=0.75*inch,
-        leftMargin=0.75*inch, rightMargin=0.75*inch
-    )
-
-    elements = []
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        textColor=HexColor('#1a1a1a'),
-        spaceAfter=30,
-        alignment=TA_LEFT
-    )
-
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=16,
-        textColor=HexColor('#2c3e50'),
-        spaceAfter=12,
-        spaceBefore=12
-    )
-
-    body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['BodyText'],
-        fontSize=11,
-        textColor=HexColor('#333333'),
-        spaceAfter=8,
-        leftIndent=0
-    )
-
-    # Title
-    title = Paragraph(f"Video Recipe: {video_name}", title_style)
-    elements.append(title)
-    elements.append(Spacer(1, 0.2*inch))
-
-    # Recipe section
-    summary_heading = Paragraph("Recipe", heading_style)
-    elements.append(summary_heading)
-
-    summary_lines = recipe.strip().split('\n')
-    for line in summary_lines:
-        if line.strip():
-            if line.strip().startswith('- ') or line.strip().startswith('* '):
-                line_text = '• ' + line.strip()[2:]
-            elif line.strip().startswith(('1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')):
-                line_text = line.strip()
-            else:
-                line_text = line.strip()
-
-            para = Paragraph(line_text, body_style)
-            elements.append(para)
-
-    elements.append(Spacer(1, 0.3*inch))
-
-    # Frames section
-    if frame_paths:
-        frames_heading = Paragraph("Key Frames from Video", heading_style)
-        elements.append(frames_heading)
-        elements.append(Spacer(1, 0.1*inch))
-
-        available_width = 6.5 * inch
-        available_height = 4 * inch
-
-        for idx, (frame_path, label) in enumerate(frame_paths):
-            if frame_path.exists():
-                img_reader = ImageReader(str(frame_path))
-                img_width, img_height = img_reader.getSize()
-                aspect = img_height / float(img_width)
-
-                display_width = available_width
-                display_height = display_width * aspect
-
-                if display_height > available_height:
-                    display_height = available_height
-                    display_width = display_height / aspect
-
-                img = Image(str(frame_path), width=display_width, height=display_height)
-                elements.append(img)
-
-                caption = Paragraph(f"<i>{label}</i>", body_style)
-                elements.append(caption)
-                elements.append(Spacer(1, 0.2*inch))
-
-    doc.build(elements)
-
-
-def process_reel_streaming(reel_url: str) -> Generator[str, None, None]:
+def process_reel_streaming(
+    reel_url: str,
+    *,
+    transcription_mode: str = "auto",
+    translate: bool = False,
+    target_lang: Optional[str] = None,
+) -> Generator[str, None, None]:
     """
     Process a reel and yield progress updates as SSE.
-    This is the core streaming logic.
     """
     try:
         yield emit_progress("init", "Starting reel processing...", 0)
@@ -400,30 +224,102 @@ def process_reel_streaming(reel_url: str) -> Generator[str, None, None]:
             yield emit_progress("audio", "Audio extraction complete!", 35)
 
             # Step 5: Transcribe
-            yield emit_progress("transcribe", "Transcribing audio (this may take a minute)...", 40)
-            transcript, segments = transcribe_with_openai(audio_path)
-            yield emit_progress("transcribe", f"Transcription complete! ({len(transcript)} characters)", 55)
+            yield emit_progress(
+                "transcribe",
+                "Transcribing audio (this may take a minute)...",
+                40,
+            )
+            transcript, segments = transcribe_audio(audio_path, mode=transcription_mode)
+            yield emit_progress(
+                "transcribe",
+                f"Transcription complete! ({len(transcript)} characters)",
+                55,
+            )
 
-            # Step 6: Summarize with OpenAI
+            # Step 6: Summarize
             yield emit_progress("summarize", "Analyzing transcript with AI...", 60)
-            transcript_with_ts = format_transcript_with_timestamps(segments)
-            recipe, key_moments = summarize_with_openai(transcript_with_ts)
-            yield emit_progress("summarize", f"Recipe extracted! Found {len(key_moments)} key moments", 75)
+            recipe, key_moments = summarize_transcript(transcript, segments)
+            original_recipe = recipe
+            original_key_moments = [dict(moment) for moment in key_moments]
+            yield emit_progress(
+                "summarize",
+                f"Recipe extracted! Found {len(original_key_moments)} key moments",
+                75,
+            )
 
             # Step 7: Extract frames
-            yield emit_progress("frames", f"Extracting {len(key_moments)} key frames from video...", 80)
-            frame_paths = extract_key_frames_from_moments(video_path, tmp_path, key_moments)
+            fallback_frame_count = max(len(original_key_moments), 5)
+            if original_key_moments:
+                yield emit_progress(
+                    "frames",
+                    f"Extracting {len(original_key_moments)} key frames from video...",
+                    80,
+                )
+                frame_paths = extract_key_frames_from_moments(
+                    video_path,
+                    tmp_path,
+                    original_key_moments,
+                    fallback_frames=fallback_frame_count,
+                )
+            else:
+                yield emit_progress(
+                    "frames",
+                    "Extracting representative frames from video...",
+                    80,
+                )
+                frame_paths = extract_key_frames(
+                    video_path,
+                    tmp_path,
+                    segments,
+                    original_recipe,
+                    num_frames=fallback_frame_count,
+                )
             yield emit_progress("frames", f"Extracted {len(frame_paths)} frames successfully!", 85)
+
+            translation_hint = (target_lang or "English") if translate else None
+            if translate and original_recipe.strip():
+                yield emit_progress(
+                    "translate",
+                    f"Translating recipe to {translation_hint}...",
+                    78,
+                )
+
+            (
+                final_recipe,
+                final_key_moments,
+                frame_paths_for_pdf,
+                applied_language,
+                translation_status,
+            ) = apply_translation_if_needed(
+                original_recipe,
+                original_key_moments,
+                frame_paths,
+                translate,
+                target_lang,
+            )
+
+            if translation_status != "not_requested":
+                if translation_status == "applied":
+                    message = f"Translation to {applied_language} complete!"
+                elif translation_status == "unchanged":
+                    message = "Translation skipped; already in requested language."
+                elif translation_status == "failed":
+                    message = "Translation unavailable, continuing with original language."
+                else:
+                    message = "Translation step finished."
+                yield emit_progress("translate", message, 79)
 
             # Step 8: Generate PDF
             yield emit_progress("pdf", "Generating PDF report...", 90)
             pdf_path = tmp_path / f"{shortcode}_summary.pdf"
 
             try:
-                generate_pdf(recipe, frame_paths, pdf_path, shortcode)
+                generate_pdf(final_recipe, frame_paths_for_pdf, pdf_path, shortcode)
                 print(f"[DEBUG] PDF generated successfully at: {pdf_path}")
                 print(f"[DEBUG] PDF file exists: {pdf_path.exists()}")
-                print(f"[DEBUG] PDF file size: {pdf_path.stat().st_size if pdf_path.exists() else 'N/A'} bytes")
+                print(
+                    f"[DEBUG] PDF file size: {pdf_path.stat().st_size if pdf_path.exists() else 'N/A'} bytes"
+                )
             except Exception as pdf_error:
                 print(f"[ERROR] PDF generation failed: {pdf_error}")
                 raise RuntimeError(f"PDF generation failed: {pdf_error}")
@@ -434,55 +330,45 @@ def process_reel_streaming(reel_url: str) -> Generator[str, None, None]:
             yield emit_progress("finalizing", "Preparing final result...", 98)
 
             try:
-                # Generate unique ID for this PDF
                 pdf_id = str(uuid.uuid4())
                 persistent_pdf_path = TEMP_PDF_DIR / f"{pdf_id}.pdf"
-
-                # Copy PDF to persistent location
                 shutil.copy2(pdf_path, persistent_pdf_path)
 
                 print(f"[DEBUG] PDF copied to persistent location: {persistent_pdf_path}")
                 print(f"[DEBUG] PDF file size: {persistent_pdf_path.stat().st_size} bytes")
-                print(f"[DEBUG] Recipe length: {len(recipe)} characters")
-                print(f"[DEBUG] Key moments count: {len(key_moments)}")
+                print(f"[DEBUG] Recipe length: {len(final_recipe)} characters")
+                print(f"[DEBUG] Key moments count: {len(final_key_moments)}")
             except Exception as save_error:
                 print(f"[ERROR] PDF save failed: {save_error}")
                 raise RuntimeError(f"PDF save failed: {save_error}")
 
-            # Final result (WITHOUT base64 data - just send download URL)
             result = {
                 "step": "complete",
                 "message": "Processing complete!",
                 "progress": 100,
                 "pdf_id": pdf_id,
                 "pdf_filename": f"{shortcode}_summary.pdf",
-                "recipe": recipe,
-                "key_moments": key_moments
+                "recipe": final_recipe,
+                "key_moments": final_key_moments,
+                "translation_language": applied_language,
+                "translation_status": translation_status,
             }
 
-            print(f"[DEBUG] Final result structure:")
-            print(f"  - step: {result['step']}")
-            print(f"  - pdf_id: {result['pdf_id']}")
-            print(f"  - pdf_filename: {result['pdf_filename']}")
-            print(f"  - recipe length: {len(result['recipe'])}")
-            print(f"  - key_moments count: {len(result['key_moments'])}")
-
             result_json = json.dumps(result)
-            print(f"[DEBUG] JSON payload size: {len(result_json)} characters")
+            print(f"[DEBUG] Final SSE message sent successfully (payload size {len(result_json)})")
 
             yield f"data: {result_json}\n\n"
-            print(f"[DEBUG] Final SSE message sent successfully")
 
     except Exception as e:
         import traceback
+
         error_traceback = traceback.format_exc()
-        print(f"[ERROR] Exception in process_reel_streaming:")
-        print(error_traceback)
+        print(f"[ERROR] Exception in process_reel_streaming:\n{error_traceback}")
 
         error_data = {
             "step": "error",
             "message": str(e),
-            "error": True
+            "error": True,
         }
         yield f"data: {json.dumps(error_data)}\n\n"
 
@@ -529,8 +415,18 @@ def summarize_reel_streaming():
     if not reel_url:
         return jsonify({"error": "Missing 'url' query parameter."}), 400
 
+    translate, target_lang = parse_translation_params(request.args)
+    transcription_mode = normalize_transcription_mode(request.args.get("mode"))
+
     return Response(
-        stream_with_context(process_reel_streaming(reel_url)),
+        stream_with_context(
+            process_reel_streaming(
+                reel_url,
+                transcription_mode=transcription_mode,
+                translate=translate,
+                target_lang=target_lang,
+            )
+        ),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -551,6 +447,9 @@ def summarize_reel_sync():
     if not reel_url:
         return jsonify({"error": "Missing 'url' query parameter."}), 400
 
+    translate, target_lang = parse_translation_params(request.args)
+    transcription_mode = normalize_transcription_mode(request.args.get("mode"))
+
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -558,31 +457,61 @@ def summarize_reel_sync():
             video_path = tmp_path / f"{shortcode}.mp4"
             pdf_path = tmp_path / f"{shortcode}_summary.pdf"
 
-            # Download video
             metadata = fetch_metadata(shortcode)
             video_url = metadata.get("video_url")
             if not video_url:
                 raise ReelDownloadError("Video URL not present in metadata response.")
             download_video(video_url, video_path)
 
-            # Extract audio
             audio_path = tmp_path / "audio.wav"
             extract_audio(video_path, audio_path)
 
-            # Transcribe
-            transcript, segments = transcribe_with_openai(audio_path)
+            transcript, segments = transcribe_audio(audio_path, mode=transcription_mode)
+            recipe, key_moments = summarize_transcript(transcript, segments)
+            original_recipe = recipe
+            original_key_moments = [dict(moment) for moment in key_moments]
 
-            # Summarize with OpenAI
-            transcript_with_ts = format_transcript_with_timestamps(segments)
-            recipe, key_moments = summarize_with_openai(transcript_with_ts)
+            fallback_frame_count = max(len(original_key_moments), 5)
+            if original_key_moments:
+                frame_paths = extract_key_frames_from_moments(
+                    video_path,
+                    tmp_path,
+                    original_key_moments,
+                    fallback_frames=fallback_frame_count,
+                )
+            else:
+                frame_paths = extract_key_frames(
+                    video_path,
+                    tmp_path,
+                    segments,
+                    original_recipe,
+                    num_frames=fallback_frame_count,
+                )
 
-            # Extract frames
-            frame_paths = extract_key_frames_from_moments(video_path, tmp_path, key_moments)
+            (
+                final_recipe,
+                final_key_moments,
+                frame_paths_for_pdf,
+                applied_language,
+                _translation_status,
+            ) = apply_translation_if_needed(
+                original_recipe,
+                original_key_moments,
+                frame_paths,
+                translate,
+                target_lang,
+            )
 
-            # Generate PDF
-            generate_pdf(recipe, frame_paths, pdf_path, shortcode)
+            generate_pdf(final_recipe, frame_paths_for_pdf, pdf_path, shortcode)
 
-            return send_file(pdf_path, as_attachment=True, download_name=f"{shortcode}_summary.pdf")
+            response = send_file(
+                pdf_path,
+                as_attachment=True,
+                download_name=f"{shortcode}_summary.pdf",
+            )
+            if applied_language:
+                response.headers["X-Translation-Language"] = applied_language
+            return response
 
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in /summarize-sync: {e}")

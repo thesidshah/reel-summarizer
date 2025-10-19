@@ -159,7 +159,7 @@ Health check endpoint
 ```
 reel-summarizer/
 ├── server/
-│   ├── server_claude.py      # Main Flask application
+│   ├── server.py      # Main Flask application
 │   ├── download_reel.py       # Instagram download utilities
 │   └── requirements.txt       # Python dependencies
 ├── frontend/

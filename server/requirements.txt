@@ -1,0 +1,7 @@
+openai==0.27.0
+faster-whisper
+whisper
+reportlab
+python-dotenv
+Flask>=2.0.0
+flask-cors
